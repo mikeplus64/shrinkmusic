@@ -4,12 +4,10 @@
 name:                shrinkmusic
 version:             0.1.0.0
 synopsis:            shrink a directory of music into another directory
--- description:         
 license:             BSD3
 license-file:        LICENSE
 author:              Mike Ledger
 maintainer:          mike@quasimal.com
--- copyright:           
 category:            Sound
 build-type:          Simple
 extra-source-files:  ChangeLog.md
@@ -17,8 +15,17 @@ cabal-version:       >=1.10
 
 executable shrinkmusic
   main-is:             Main.hs
-  -- other-modules:       
-  -- other-extensions:    
-  build-depends:       base >=4.9 && <4.10
-  -- hs-source-dirs:      
+  ghc-options:         -O2 -threaded -rtsopts
+  build-depends:       base >=4.9 && <4.12,
+                       turtle >= 1.5 && <1.6,
+                       foldl,
+                       text,
+                       bytestring,
+                       parallel-io,
+                       mtl,
+                       containers,
+                       system-filepath,
+                       time,
+                       terminal-progress-bar >= 0.2 && <0.3
+                       
   default-language:    Haskell2010

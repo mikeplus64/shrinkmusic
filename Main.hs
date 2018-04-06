@@ -3,8 +3,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 import           Control.Concurrent.ParallelIO.Local
 import qualified Control.Foldl                       as F
-import           Control.Monad                       (filterM)
-import           Data.Maybe                          (fromJust)
+import           Control.Monad                       (filterM, forM_)
 import qualified Data.Set                            as Set
 import qualified Data.Text                           as T
 import           Data.Time
@@ -19,13 +18,8 @@ data Opts = Opts
   , output  :: !FilePath
   , bitrate :: !Text
   , jobs    :: !Int
+  , dryRun  :: !Bool
   }
-
-data Conversion
-  = Ignored !FilePath
-  | Copied !FilePath !FilePath
-  | Converted !FilePath !FilePath
-  deriving (Show)
 
 data ConvertProgress = ConvertProgress
   { start        :: {-# UNPACK #-} !UTCTime
@@ -39,66 +33,52 @@ instance HasProgress ConvertProgress where
 f2t :: FilePath -> Text
 f2t = either id id . toText
 
-inc :: ProgressRef ConvertProgress -> Action -> (FilePath, FilePath) -> IO ()
-inc ref _dec _frto = do
-  now <- date
-  incProgress ref $ \c -> c
-    { now
-    , convprogress = (convprogress c)
-      { progressDone = progressDone (convprogress c) + 1 }
-    }
-  {-
-  where
-    mkConversion Copy (from, to)    = Copied from to
-    mkConversion Ignore (from, _)   = Ignored from
-    mkConversion Convert (from, to) = Converted from to -}
-
 data Action
-  = Copy
-  | Convert
-  | Ignore
+  = Copy { from, to :: !FilePath }
+  | Convert { from, to :: !FilePath }
 
-decide :: FilePath -> IO Action
-decide from
+decide :: Opts -> FilePath -> [Action]
+decide Opts{input, output} from
   = ignoreDot (encodeString from)
   $ ignoreDot (encodeString (filename from))
   $ ignorePlaylists
   $ copyMusic
   $ convertMusic
   $ copyImages
-  $ return Ignore
+  $ []
   where
-    ignoreDot ('.':_) = const (return Ignore)
-    ignoreDot _       = id
-    testExt exts r = case extension from of
-      Just ext | Set.member (T.toLower ext) exts -> const (return r)
-      _        -> id
-    ignorePlaylists = testExt playlistExts Ignore
-    convertMusic = testExt musicExts Convert
-    copyMusic = testExt keepMusicExts Copy
-    copyImages = testExt imageExts Copy
+    to = case stripPrefix input from of
+      Just relpath -> output </> mapBadChars relpath
+      Nothing      -> error $ "could not extract prefix from " ++ show from
 
-convertOrCopy :: Opts -> (FilePath, FilePath) -> IO Action
-convertOrCopy Opts{bitrate} (from, to) = decide from >>= \case
-  Ignore  -> return Ignore
-  Copy    -> Copy <$ procs "cp" [f2t from, f2t to] mempty
-  Convert -> do
-    code <- proc
-      "ffmpeg"
-      [ "-loglevel", "quiet"
-      , "-i" , f2t from
-      , "-codec:a", "libopus"
-      , "-b:a", bitrate
-      , "-vbr", "on"
-      , "-compression_level", "10"
-      , "-map_metadata", "0:g"
-      , "-n"
-      , f2t (replaceExtension to "ogg")
-      ]
-      mempty
-    case code of
-      ExitSuccess   -> return Convert
-      ExitFailure _ -> Copy <$ procs "cp" [f2t from, f2t to] mempty
+    ignoreDot ('.':_) = const []
+    ignoreDot _       = id
+
+    testExt exts r = case extension from of
+      Just ext | Set.member (T.toLower ext) exts -> const r
+      _        -> id
+
+    ignorePlaylists = testExt playlistExts []
+    convertMusic = testExt musicExts [Convert{from, to=replaceExtension to "ogg"}]
+    copyMusic = testExt keepMusicExts [Copy{from, to}]
+    copyImages = testExt imageExts [Copy{from, to}]
+
+interpret :: Opts -> Action -> IO ()
+interpret _    (Copy from to)    = procs "cp" [f2t from, f2t to] mempty
+interpret opts (Convert from to) = proc
+  "ffmpeg"
+  [ "-loglevel", "quiet"
+  , "-i" , f2t from
+  , "-codec:a", "libopus"
+  , "-b:a", bitrate opts
+  , "-vbr", "on"
+  , "-compression_level", "10"
+  , "-map_metadata", "0:g"
+  , "-n"
+  , f2t to
+  ] mempty >>= \case
+  ExitSuccess   -> return ()
+  ExitFailure _ -> interpret opts (Copy from to)
 
 mapBadChars :: FilePath -> FilePath
 mapBadChars orig =
@@ -113,48 +93,57 @@ mapBadChars orig =
 
 main :: IO ()
 main = do
-  opts@Opts{input, output, jobs} <- options "shrinkmusic" $ Opts
+  opts@Opts{input, jobs, dryRun} <- options "shrinkmusic" $ Opts
     <$> fmap (</> "") (optPath "input" 'i' "Input directory")
     <*> fmap (</> "") (optPath "output" 'o' "Output directory")
     <*> optText "bitrate" 'b' "bitrate for audio"
     <*> optInt "jobs" 'j' "Number of jobs to use"
-
+    <*> switch "dry-run" 'd' "Do nothing; just output the plan"
   -- takes *all* files so we can copy everything over
   absStuff <- lstree input `fold` F.list
   absFiles <- filterM testfile absStuff
-
-  let filesAndRels = [ (absf, mapBadChars (fromJust (stripPrefix input absf)))
-                     | absf <- absFiles
-                     ]
-  let dirs = Set.fromList (map ((output </>) . directory . snd) filesAndRels)
-  let files = map (\(absf, relf) -> (absf, output </> mapBadChars relf)) filesAndRels
-  mapM_ mktree dirs
+  let actions = concatMap (decide opts) absFiles
+  mapM_ (mktree . directory . to) actions
   start0 <- date
 
-  (progRef, _) <- startProgress
-    exact
-    (\ConvertProgress{ convprogress=Progress{progressDone, progressTodo}
-                     , start
-                     , now
-                     } ->
-        let
-          elapsed, avg, remain :: Double
-          elapsed = realToFrac (diffUTCTime now start)
-          avg = elapsed / fromInteger progressDone
-          remain = avg * fromInteger (progressTodo - progressDone)
-        in P.printf "%.2fs elapsed. %0.2fs remaining" elapsed remain)
-    40
-    ConvertProgress
-    { start = start0
-    , now = start0
-    , convprogress = Progress
-      { progressDone = 0
-      , progressTodo = toInteger (length files)
-      }
-    }
-  withPool jobs $ \pool ->
-    parallel_ pool (map (\q -> do dec <- convertOrCopy opts q
-                                  inc progRef dec q) files)
+  if dryRun
+    then do
+      putStrLn "shrinkmusic plan:"
+      forM_ actions $ \case
+        Copy{from, to}    -> printf ("copy:    " % w % " --> " % w % "\n") from to
+        Convert{from, to} -> printf ("convert: " % w % " --> " % w % "\n") from to
+    else do
+      (progRef, _) <- startProgress
+        exact
+        (\ConvertProgress{ convprogress=Progress{progressDone, progressTodo}, start
+                        , now } ->
+          let
+            elapsed, avg, remain :: Double
+            elapsed = realToFrac (diffUTCTime now start)
+            avg = elapsed / fromInteger progressDone
+            remain = avg * fromInteger (progressTodo - progressDone)
+          in P.printf "%.2fs elapsed. %0.2fs remaining" elapsed remain)
+        40
+        ConvertProgress
+        { start = start0
+        , now = start0
+        , convprogress = Progress
+          { progressDone = 0
+          , progressTodo = toInteger (length actions)
+          }
+        }
+      let
+        step :: Action -> IO ()
+        step action = do
+          interpret opts action
+          now <- date
+          incProgress progRef $ \c -> c
+            { now
+            , convprogress = (convprogress c)
+              { progressDone = progressDone (convprogress c) + 1
+              }
+            }
+      withPool jobs (\pool -> parallel_ pool (map step actions))
 
 playlistExts :: Set.Set Text
 playlistExts = Set.fromList
@@ -169,7 +158,7 @@ musicExts = Set.fromList
 
 keepMusicExts :: Set.Set Text
 keepMusicExts = Set.fromList
-  ["ogg", "mp3", "opus", "aac"]
+  ["ogg", "mp3", "opus", "aac", "mp2", "mp1"]
 
 imageExts :: Set.Set Text
 imageExts = Set.fromList
@@ -177,7 +166,7 @@ imageExts = Set.fromList
   , "dds", "dib", "djvu", "egt", "exif", "gif", "gpl", "grf", "icns"
   , "ico", "iff", "jng", "jpeg", "jpg", "jfif", "jp2", "jps", "lbm"
   , "max", "miff", "mng", "msp", "nitf", "ota", "pbm", "pc1", "pc2"
-  , "pc3", "pcf", "pcx", "pdn", "pgm", "PI1", "PI2", "PI3", "pict", "pct"
+  , "pc3", "pcf", "pcx", "pdn", "pgm", "pi1", "pi2", "pi3", "pict", "pct"
   , "pnm", "pns", "ppm", "psb", "psd", "pdd", "psp", "px", "pxm", "pxr"
   , "qfx", "raw", "rle", "sct", "sgi", "rgb", "int", "bw", "tga"
   , "tiff", "tif", "vtf", "xbm", "xcf", "xpm", "3dv", "amf", "ai", "awg"

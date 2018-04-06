@@ -123,7 +123,9 @@ main = do
   absStuff <- lstree input `fold` F.list
   absFiles <- filterM testfile absStuff
 
-  let filesAndRels = [ (absf, fromJust (stripPrefix input absf)) | absf <- absFiles ]
+  let filesAndRels = [ (absf, mapBadChars (fromJust (stripPrefix input absf)))
+                     | absf <- absFiles
+                     ]
   let dirs = Set.fromList (map ((output </>) . directory . snd) filesAndRels)
   let files = map (\(absf, relf) -> (absf, output </> mapBadChars relf)) filesAndRels
   mapM_ mktree dirs

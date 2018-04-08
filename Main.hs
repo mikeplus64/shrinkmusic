@@ -1,9 +1,12 @@
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE OverloadedStrings #-}
+import           Control.Arrow                       ((&&&))
 import           Control.Concurrent.ParallelIO.Local
 import qualified Control.Foldl                       as F
-import           Control.Monad                       (filterM, forM_)
+import           Control.Monad                       (filterM, foldM, forM_)
+import           Data.Foldable                       (fold)
+import qualified Data.Map.Strict                     as Map
 import qualified Data.Set                            as Set
 import qualified Data.Text                           as T
 import           Data.Time
@@ -11,7 +14,9 @@ import           Filesystem.Path.CurrentOS           (replaceExtension)
 import           Prelude                             hiding (FilePath)
 import           System.ProgressBar.State
 import qualified Text.Printf                         as P
-import           Turtle                              hiding (input, output)
+import           Turtle                              hiding (find, fold, input,
+                                                      output)
+import qualified Turtle
 
 data Opts = Opts
   { input   :: !FilePath
@@ -42,11 +47,15 @@ decide Opts{input, output} from
   = ignoreDot (encodeString from)
   $ ignoreDot (encodeString (filename from))
   $ ignorePlaylists
+  $ convert320mp3dir
   $ copyMusic
   $ convertMusic
   $ copyImages
   $ []
   where
+    ext = extension from
+    dir = T.toLower (f2t (directory from))
+
     to = case stripPrefix input from of
       Just relpath -> output </> mapBadChars relpath
       Nothing      -> error $ "could not extract prefix from " ++ show from
@@ -54,11 +63,33 @@ decide Opts{input, output} from
     ignoreDot ('.':_) = const []
     ignoreDot _       = id
 
-    testExt exts r = case extension from of
-      Just ext | Set.member (T.toLower ext) exts -> const r
-      _        -> id
+    testExt exts r = case ext of
+      Just ext' | Set.member (T.toLower ext') exts -> const r
+      _         -> id
 
     ignorePlaylists = testExt playlistExts []
+
+    bitrate320dir =
+      contains (choice
+                [ between "(" ")" bitrate320
+                , between "[" "]" bitrate320
+                , "@" >> bitrate320
+                ]) <|>
+      suffix bitrate320
+
+    bitrate320 = do
+      _ <- "320"
+      option $ choice
+        [ "kbps"
+        , "kps"
+        , "kbs"
+        , "k"
+        ]
+    convert320mp3dir =
+      if ext == Just "mp3" && not (null (match bitrate320dir dir))
+      then const [Convert {from, to=replaceExtension to "ogg"}]
+      else id
+
     convertMusic = testExt musicExts [Convert{from, to=replaceExtension to "ogg"}]
     copyMusic = testExt keepMusicExts [Copy{from, to}]
     copyImages = testExt imageExts [Copy{from, to}]
@@ -69,6 +100,7 @@ interpret opts (Convert from to) = proc
   "ffmpeg"
   [ "-loglevel", "quiet"
   , "-i" , f2t from
+  , "-vn"
   , "-codec:a", "libopus"
   , "-b:a", bitrate opts
   , "-vbr", "on"
@@ -86,37 +118,58 @@ mapBadChars orig =
   then orig
   else decodeString (concatMap unbad str)
   where
-    bads = "?<>\\" :: String
-    unbad c = if c `elem` bads then [] else [c]
+    bads = "?<>\\|" :: String
+    unbad '|' = ")"
+    unbad c   = if c `elem` bads then [] else [c]
     str = encodeString orig
     onlyBads = filter (`elem` bads) str
 
 main :: IO ()
 main = do
-  opts@Opts{input, jobs, dryRun} <- options "shrinkmusic" $ Opts
+  opts@Opts{input, output, jobs, dryRun} <- options "shrinkmusic" $ Opts
     <$> fmap (</> "") (optPath "input" 'i' "Input directory")
     <*> fmap (</> "") (optPath "output" 'o' "Output directory")
     <*> optText "bitrate" 'b' "bitrate for audio"
     <*> optInt "jobs" 'j' "Number of jobs to use"
     <*> switch "dry-run" 'd' "Do nothing; just output the plan"
   -- takes *all* files so we can copy everything over
-  absStuff <- lstree input `fold` F.list
-  absFiles <- filterM testfile absStuff
-  let actions = concatMap (decide opts) absFiles
-  mapM_ (mktree . directory . to) actions
-  start0 <- date
 
+  inFiles <- lstree input `Turtle.fold` F.list >>= filterM testfile
+
+  let actions0 = concatMap (decide opts) inFiles
+
+  -- find where files were deleted from original folder i.e., the files in the
+  -- destination folder that are not accounted for by the action plan
+  destfiles <- Set.fromList
+    <$> (lstree output `Turtle.fold` F.list >>= filterM testfile)
+  let deletes = destfiles `Set.difference` Set.fromList (map to actions0)
+
+  -- filter out where the destination file already exists
+  actions <- filterM (fmap not . testfile . to) actions0
+  start0 <- date
   if dryRun
     then do
       putStrLn "shrinkmusic plan:"
+      forM_ deletes $ printf ("delete:  " % fp % "\n")
+
       forM_ actions $ \case
-        Copy{from, to}    -> printf ("copy:    " % w % " --> " % w % "\n") from to
-        Convert{from, to} -> printf ("convert: " % w % " --> " % w % "\n") from to
+        Copy{from, to}    -> printf ("copy:    " % fp % " --> " % fp % "\n") from to
+        Convert{from, to} -> printf ("convert: " % fp % " --> " % fp % "\n") from to
+
     else do
+      putStrLn "making directory tree..."
+      mapM_ (mktree . directory . to) actions
+
+
+      unless (Set.null deletes) $ do
+        putStrLn "running deletes..."
+        mapM_ rm deletes
+
+      putStrLn "converting..."
       (progRef, _) <- startProgress
         exact
         (\ConvertProgress{ convprogress=Progress{progressDone, progressTodo}, start
-                        , now } ->
+                         , now } ->
           let
             elapsed, avg, remain :: Double
             elapsed = realToFrac (diffUTCTime now start)
@@ -143,6 +196,7 @@ main = do
               { progressDone = progressDone (convprogress c) + 1
               }
             }
+
       withPool jobs (\pool -> parallel_ pool (map step actions))
 
 playlistExts :: Set.Set Text
@@ -154,7 +208,7 @@ musicExts = Set.fromList
   [ "amr", "mp1", "mp2", "mp3", "spx", "gsm", "wma", "aac", "mpc", "vqf"
   , "ots", "vox", "voc", "dwd", "smp", "ogg", "ra", "rm", "flac", "la"
   , "pac", "ape", "ofr", "ofs", "off", "rka", "shn", "tak", "tta", "wv"
-  , "wma", "brstm", "dts", "dtshd", "dtsma", "ast", "aw", "psf"]
+  , "wma", "brstm", "dts", "dtshd", "dtsma", "ast", "aw", "psf", "webm"]
 
 keepMusicExts :: Set.Set Text
 keepMusicExts = Set.fromList

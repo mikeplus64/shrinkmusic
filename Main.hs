@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase        #-}
+{-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE OverloadedStrings #-}
 import           Control.Arrow                       ((&&&))
@@ -6,7 +7,7 @@ import           Control.Concurrent.ParallelIO.Local
 import qualified Control.Foldl                       as F
 import           Control.Monad                       (filterM, foldM, forM_)
 import           Data.Foldable                       (fold)
-import qualified Data.Map.Strict                     as Map
+import qualified Data.MKarma No Kusariap.Strict                     as Map
 import qualified Data.Set                            as Set
 import qualified Data.Text                           as T
 import           Data.Time
@@ -42,6 +43,12 @@ data Action
   = Copy { from, to :: !FilePath }
   | Convert { from, to :: !FilePath }
 
+mkTestExt :: Maybe Text -> Set.Set Text -> a -> a -> a
+mkTestExt f exts yes no = case f of
+  Just ext | Set.member (T.toLower ext) exts -> yes
+  _                                          -> no
+
+
 decide :: Opts -> FilePath -> [Action]
 decide Opts{input, output} from
   = ignoreDot (encodeString from)
@@ -63,9 +70,7 @@ decide Opts{input, output} from
     ignoreDot ('.':_) = const []
     ignoreDot _       = id
 
-    testExt exts r = case ext of
-      Just ext' | Set.member (T.toLower ext') exts -> const r
-      _         -> id
+    testExt exts r = mkTestExt ext exts (const r) id
 
     ignorePlaylists = testExt playlistExts []
 
@@ -124,6 +129,14 @@ mapBadChars orig =
     str = encodeString orig
     onlyBads = filter (`elem` bads) str
 
+data PlanPhase
+  = ReadingFiles
+  | FilteringExisting
+  | FilteringNonMusicalDirectories
+  | CreatingActions
+  | Done
+  deriving (Show, Eq, Ord, Enum, Bounded)
+
 main :: IO ()
 main = do
   opts@Opts{input, output, jobs, dryRun} <- options "shrinkmusic" $ Opts
@@ -134,27 +147,64 @@ main = do
     <*> switch "dry-run" 'd' "Do nothing; just output the plan"
   -- takes *all* files so we can copy everything over
 
+  putStrLn "constructing plan..."
+
+  let
+    planProgress :: PlanPhase -> IO ()
+    planProgress pp =
+      (autoProgressBar :: ProgressBar Progress (IO ()))
+      exact
+      noLabel
+      40
+      Progress{ progressDone = toInteger (fromEnum (pp :: PlanPhase))
+              , progressTodo = toInteger (fromEnum (maxBound :: PlanPhase)) }
+
+  planProgress ReadingFiles
   inFiles <- lstree input `Turtle.fold` F.list >>= filterM testfile
 
   let actions0 = concatMap (decide opts) inFiles
+  let targets = Set.fromList (map to actions0)
 
   -- find where files were deleted from original folder i.e., the files in the
   -- destination folder that are not accounted for by the action plan
-  destfiles <- Set.fromList
+  planProgress FilteringExisting
+  !deletes <-
+    (\destfiles -> Set.fromList destfiles `Set.difference` targets)
     <$> (lstree output `Turtle.fold` F.list >>= filterM testfile)
-  let deletes = destfiles `Set.difference` Set.fromList (map to actions0)
 
-  -- filter out where the destination file already exists
-  actions <- filterM (fmap not . testfile . to) actions0
+  -- find directories that have no music in them (e.g., they're cover image
+  -- scans; stuff i don't care about for my phone)
+  planProgress FilteringNonMusicalDirectories
+
+  let dirs2targets = Map.fromListWith Set.union
+                     (map ((directory &&& Set.singleton) . to) actions0)
+  let isMusicOrSubdir p =
+        mkTestExt (extension p) musicExts True False ||
+        directory p == p
+  let !nonmusicdirs =
+        Map.filter (not . any isMusicOrSubdir) dirs2targets
+
+  planProgress CreatingActions
+  actions <- filterM
+    (\p -> do
+        -- filter out where the destination file already exists
+        alreadyExists <- testfile (to p)
+        return (not alreadyExists && directory (to p) `Map.notMember` nonmusicdirs))
+    actions0
+
+  planProgress Done
+
   start0 <- date
   if dryRun
     then do
-      putStrLn "shrinkmusic plan:"
-      forM_ deletes $ printf ("delete:  " % fp % "\n")
-
-      forM_ actions $ \case
-        Copy{from, to}    -> printf ("copy:    " % fp % " --> " % fp % "\n") from to
-        Convert{from, to} -> printf ("convert: " % fp % " --> " % fp % "\n") from to
+      -- forM_ (Map.keys nonmusicdirs) $ printf ("ignore dir: " % fp % "\n")
+      -- forM_ deletes $ printf ("delete:     " % fp % "\n")
+      forM_ actions $ printf (fp % "\n") . from
+      {-
+      \case
+        Copy{from, to}    -> printf fp from
+        Convert{from, to} -> printf fp from
+-}
 
     else do
       putStrLn "making directory tree..."
@@ -208,7 +258,8 @@ musicExts = Set.fromList
   [ "amr", "mp1", "mp2", "mp3", "spx", "gsm", "wma", "aac", "mpc", "vqf"
   , "ots", "vox", "voc", "dwd", "smp", "ogg", "ra", "rm", "flac", "la"
   , "pac", "ape", "ofr", "ofs", "off", "rka", "shn", "tak", "tta", "wv"
-  , "wma", "brstm", "dts", "dtshd", "dtsma", "ast", "aw", "psf", "webm"]
+  , "wma", "brstm", "dts", "dtshd", "dtsma", "ast", "aw", "psf", "webm", "wav"
+  , "m4a" ]
 
 keepMusicExts :: Set.Set Text
 keepMusicExts = Set.fromList

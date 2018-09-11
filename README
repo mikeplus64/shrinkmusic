@@ -1,0 +1,17 @@
+# shrinkmusic
+Shrinks a big directory of music. Like a version of rsync for music, that
+lossily compresses certain formats to Opus. Useful for copying a large music
+collection onto a less large SD card for use on Android.
+
+## Dependencies
+- ffmpeg with libopus, support for whatever formats your collection has
+- shntool
+- cuetools
+
+## Features
+- Has a dry run mode
+- Attempts to determine whether conversion is worthwhile or not (e.g., for any
+  old .mp3, it probably isn't...)
+- Supports selective ignoring of files/directories
+- Splits, tags, and converts XXX.cue and XXX.flac pairs
+- Runs in parallel

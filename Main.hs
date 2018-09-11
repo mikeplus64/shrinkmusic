@@ -24,16 +24,16 @@ import           System.ProgressBar.State
 import qualified Text.Printf                         as P
 import           Turtle                              (ExitCode (..), FilePath,
                                                       between, choice, contains,
-                                                      d, date, decodeString,
+                                                      cp, d, date, decodeString,
                                                       directory, du,
                                                       encodeString, extension,
                                                       filename, fp, lstree,
-                                                      match, mktree, optInt,
+                                                      match, mktree, mv, optInt,
                                                       optPath, optText, option,
-                                                      options, printf, proc,
-                                                      procs, rm, suffix, switch,
-                                                      sz, testdir, testfile,
-                                                      (%), (<.>), (</>))
+                                                      options, printf, proc, rm,
+                                                      suffix, switch, sz,
+                                                      testdir, testfile, (%),
+                                                      (<.>), (</>))
 import qualified Turtle
 
 data Opts = Opts
@@ -71,6 +71,11 @@ data Splitter = Splitter
 data Action
   = Map !Mapping
   | Split !Splitter
+  deriving (Show, Eq, Ord)
+
+data FsAction
+  = FsCopy { fsfrom, fsto :: !FilePath }
+  | FsMove { fsfrom, fsto :: !FilePath }
   deriving (Show, Eq, Ord)
 
 mkTestExt :: Maybe Text -> Set.Set Text -> a -> a -> a
@@ -162,9 +167,10 @@ splitCues mappings =
 
     foundPairs = Set.fromList (concatMap (\s -> [cue s, flac s]) splits)
 
-interpret :: Opts -> Action -> IO ()
-interpret _    (Map Copy{from, to}) = procs "cp" [f2t from, f2t to] mempty
-interpret opts (Map Convert{from, to}) = proc
+interpret :: FilePath -> Opts -> Action -> IO [FsAction]
+interpret _ _ (Map Copy{from, to}) =
+  return [FsCopy{fsfrom=from, fsto=to}]
+interpret tout opts (Map Convert{from, to}) = proc
   "ffmpeg"
   [ "-loglevel", "quiet"
   , "-i" , f2t from
@@ -175,12 +181,17 @@ interpret opts (Map Convert{from, to}) = proc
   , "-compression_level", "10"
   , "-map_metadata", "0:g"
   , "-n"
-  , f2t to
+  , f2t tout
   ] mempty >>= \case
-  ExitSuccess   -> return ()
-  ExitFailure _ -> interpret opts (Map Copy{from, to})
-interpret opts (Split Splitter{cue, flac, toDir}) =
-  withSystemTempDirectory "shrinkmusic" $ \tmpl -> do
+
+  ExitSuccess   ->
+    return [FsMove{fsfrom=tout, fsto=to}]
+
+  ExitFailure _ ->
+    return [FsCopy{fsfrom=tout, fsto=to}]
+
+interpret tmpf opts (Split Splitter{cue, flac, toDir}) = do
+  mktree tmpf
   -- Even if the cue file is left "dangling" at the end of this, we still
   -- include it in the output, just so that the "evidence" of the splitting
   -- remains, so shrinkmusic doesn't try to duplicate work on a second
@@ -189,12 +200,11 @@ interpret opts (Split Splitter{cue, flac, toDir}) =
   -- Since media players might be confused by a cue file referring to a flac
   -- that doesn't exist, we rename it to %f.cue.split, if and only if we succeed
   -- in doing the cue split.
-  let !tmpf = decodeString tmpl
   proc "shnsplit"
     [ "-f", f2t (from cue)
     , "-o", "flac", f2t (from flac)
     , "-t", "%n %t"
-    , "-d", T.pack tmpl
+    , "-d", f2t tmpf
     ] mempty
     >>= \case
 
@@ -205,22 +215,26 @@ interpret opts (Split Splitter{cue, flac, toDir}) =
         ExitSuccess   -> return ()
         ExitFailure _ -> printf ("Warning: cuetag.sh failed for " % fp % "\n") (from cue)
 
-      interpret opts (Map cue{to=to cue <.> "split"})
-
-      mapM_ (interpret opts)
-        [ Map Convert
-          { from=out
-          , to=toDir </> replaceExtension (filename out) "ogg"
-          }
-        | out <- flacOuts
+      (FsCopy{fsfrom=from cue, fsto=to cue} :) . concat <$> sequence
+        [ interpret tout opts (Map Convert
+          { from=flacOut
+          , to=toDir </> replaceExtension (filename flacOut) "ogg"
+          })
+        | (i, flacOut) <- zip [0 :: Int ..] flacOuts
+        , let tout = tmpf </> decodeString (show i)
         ]
 
-    ExitFailure _ -> do
+    ExitFailure _ ->
       -- flac is probably reasonably compressable when it's a giant file, less
       -- gain to be had by converting one big flac rather than lots of littler
       -- ones
-      interpret opts (Map cue)
-      interpret opts (Map flac)
+      return [ FsCopy{fsfrom=from cue, fsto=to cue}
+             , FsCopy{fsfrom=from flac, fsto=to flac}
+             ]
+
+interpretFs :: FsAction -> IO ()
+interpretFs FsCopy{fsfrom, fsto} = cp fsfrom fsto
+interpretFs FsMove{fsfrom, fsto} = mv fsfrom fsto
 
 mapBadChars :: FilePath -> FilePath
 mapBadChars orig =
@@ -377,9 +391,9 @@ main = do
           }
         }
       let
-        step :: Action -> IO ()
-        step action = do
-          interpret opts action
+        step :: FilePath -> Action -> IO [FsAction]
+        step tmpf action = do
+          fs <- interpret tmpf opts action
           now <- date
           incProgress progRef $ \c -> c
             { now
@@ -387,7 +401,21 @@ main = do
               { progressDone = progressDone (convprogress c) + 1
               }
             }
-      withPool jobs (\pool -> parallel_ pool (map step actions))
+          return fs
+
+      withSystemTempDirectory "shrinkmusic" $ \tempOutDir -> do
+        let ftempOutDir = decodeString tempOutDir
+        fsActs <- fmap concat . withPool jobs $ \pool -> parallelInterleaved pool
+          [ step tmpf act
+          | (i, act) <- zip [0 :: Int ..] actions
+          , let tmpf = ftempOutDir </> decodeString (show i)
+          ]
+        print (length fsActs)
+        mapM_ (\fs -> do
+                  putChar '\n'
+                  print fs
+                  putChar '\n'
+                  interpretFs fs) fsActs
 
 playlistExts :: Set.Set Text
 playlistExts = Set.fromList

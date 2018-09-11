@@ -30,8 +30,8 @@ import           Turtle                              (ExitCode (..), FilePath,
                                                       optInt, optPath, optText,
                                                       option, options, printf,
                                                       proc, procs, rm, suffix,
-                                                      switch, testfile, (%),
-                                                      (<.>), (</>))
+                                                      switch, testdir, testfile,
+                                                      (%), (<.>), (</>))
 import qualified Turtle
 
 data Opts = Opts
@@ -39,6 +39,7 @@ data Opts = Opts
   , output  :: !FilePath
   , bitrate :: !Text
   , jobs    :: !Int
+  , ignores :: !(Set FilePath)
   , dryRun  :: !Bool
   }
 
@@ -76,8 +77,9 @@ mkTestExt thing exts y n = case thing of
   _                                          -> n
 
 decideMappings :: Opts -> FilePath -> [Mapping]
-decideMappings Opts{input, output} from
-  = ignoreDot (encodeString from)
+decideMappings Opts{input, output, ignores} from
+  = respectIgnores
+  . ignoreDot (encodeString from)
   . ignoreDot (encodeString (filename from))
   . ignorePlaylists
   . convert320mp3dir
@@ -86,6 +88,11 @@ decideMappings Opts{input, output} from
   . copyImages
   $ []
   where
+    respectIgnores =
+      if Set.member from ignores
+      then const []
+      else id
+
     testExt exts r = mkTestExt ext exts (const r) id
     ext = Turtle.extension from
     dir = T.toLower (f2t (Turtle.directory from))
@@ -235,12 +242,24 @@ data PlanPhase
 
 main :: IO ()
 main = do
-  opts@Opts{input, output, jobs, dryRun} <- options "shrinkmusic" $ Opts
+  opts0@Opts{input, output, jobs, dryRun, ignores} <- options "shrinkmusic" $ Opts
     <$> fmap (</> "") (optPath "input" 'i' "Input directory")
     <*> fmap (</> "") (optPath "output" 'o' "Output directory")
     <*> optText "bitrate" 'b' "bitrate for audio"
     <*> optInt "jobs" 'j' "Number of jobs to use"
+    <*> (Set.fromList `fmap` many (optPath "ignore" 'z' "Ignore this file") <|>
+         pure Set.empty)
     <*> switch "dry-run" 'd' "Do nothing; just output the plan"
+
+  ignoreRecur <- fmap (Set.fromList . concat) . forM (Set.toList ignores) $
+    \i -> do
+      isDir <- testdir i
+      if isDir
+        then lstree i `Turtle.fold` F.list >>= filterM testfile
+        else return [i]
+
+  let opts = opts0{ignores=ignoreRecur}
+
   -- takes *all* files so we can copy everything over
 
   putStrLn "constructing plan..."

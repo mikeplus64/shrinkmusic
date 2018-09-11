@@ -1,22 +1,37 @@
-{-# LANGUAGE LambdaCase        #-}
-{-# LANGUAGE BangPatterns        #-}
-{-# LANGUAGE NamedFieldPuns    #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE BangPatterns          #-}
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE LambdaCase            #-}
+{-# LANGUAGE NamedFieldPuns        #-}
+{-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE PatternSynonyms       #-}
+import           Control.Applicative
 import           Control.Arrow                       ((&&&))
 import           Control.Concurrent.ParallelIO.Local
 import qualified Control.Foldl                       as F
-import           Control.Monad                       (filterM, foldM, forM_)
-import           Data.Foldable                       (fold)
-import qualified Data.MKarma No Kusariap.Strict                     as Map
+import           Control.Monad.State.Strict
+import           Data.Map.Strict                     (Map)
+import qualified Data.Map.Strict                     as Map
+import           Data.Set                            (Set)
 import qualified Data.Set                            as Set
+import           Data.Text                           (Text)
 import qualified Data.Text                           as T
 import           Data.Time
 import           Filesystem.Path.CurrentOS           (replaceExtension)
 import           Prelude                             hiding (FilePath)
+import           System.IO.Temp                      (withSystemTempDirectory)
 import           System.ProgressBar.State
 import qualified Text.Printf                         as P
-import           Turtle                              hiding (find, fold, input,
-                                                      output)
+import           Turtle                              (ExitCode (..), FilePath,
+                                                      between, choice, contains,
+                                                      d, date, decodeString,
+                                                      directory, encodeString,
+                                                      extension, filename, fp,
+                                                      lstree, match, mktree,
+                                                      optInt, optPath, optText,
+                                                      option, options, printf,
+                                                      proc, procs, rm, suffix,
+                                                      switch, testfile, (%),
+                                                      (<.>), (</>))
 import qualified Turtle
 
 data Opts = Opts
@@ -37,43 +52,49 @@ instance HasProgress ConvertProgress where
   getProgress = convprogress
 
 f2t :: FilePath -> Text
-f2t = either id id . toText
+f2t = either id id . Turtle.toText
 
-data Action
+data Mapping
   = Copy { from, to :: !FilePath }
   | Convert { from, to :: !FilePath }
+  deriving (Show, Eq, Ord)
+
+data Splitter = Splitter
+  { cue   :: !Mapping
+  , flac  :: !Mapping
+  , toDir :: !FilePath
+  } deriving (Show, Eq, Ord)
+
+data Action
+  = Map !Mapping
+  | Split !Splitter
+  deriving (Show, Eq, Ord)
 
 mkTestExt :: Maybe Text -> Set.Set Text -> a -> a -> a
-mkTestExt f exts yes no = case f of
-  Just ext | Set.member (T.toLower ext) exts -> yes
-  _                                          -> no
+mkTestExt thing exts y n = case thing of
+  Just ext | Set.member (T.toLower ext) exts -> y
+  _                                          -> n
 
-
-decide :: Opts -> FilePath -> [Action]
-decide Opts{input, output} from
+decideMappings :: Opts -> FilePath -> [Mapping]
+decideMappings Opts{input, output} from
   = ignoreDot (encodeString from)
-  $ ignoreDot (encodeString (filename from))
-  $ ignorePlaylists
-  $ convert320mp3dir
-  $ copyMusic
-  $ convertMusic
-  $ copyImages
+  . ignoreDot (encodeString (filename from))
+  . ignorePlaylists
+  . convert320mp3dir
+  . copyMusic
+  . convertMusic
+  . copyImages
   $ []
   where
-    ext = extension from
-    dir = T.toLower (f2t (directory from))
-
-    to = case stripPrefix input from of
+    testExt exts r = mkTestExt ext exts (const r) id
+    ext = Turtle.extension from
+    dir = T.toLower (f2t (Turtle.directory from))
+    to = case Turtle.stripPrefix input from of
       Just relpath -> output </> mapBadChars relpath
       Nothing      -> error $ "could not extract prefix from " ++ show from
-
     ignoreDot ('.':_) = const []
     ignoreDot _       = id
-
-    testExt exts r = mkTestExt ext exts (const r) id
-
     ignorePlaylists = testExt playlistExts []
-
     bitrate320dir =
       contains (choice
                 [ between "(" ")" bitrate320
@@ -81,7 +102,6 @@ decide Opts{input, output} from
                 , "@" >> bitrate320
                 ]) <|>
       suffix bitrate320
-
     bitrate320 = do
       _ <- "320"
       option $ choice
@@ -90,18 +110,52 @@ decide Opts{input, output} from
         , "kbs"
         , "k"
         ]
+    conversion = Convert{from, to=replaceExtension to "ogg"}
+    copy = Copy{from, to}
     convert320mp3dir =
       if ext == Just "mp3" && not (null (match bitrate320dir dir))
-      then const [Convert {from, to=replaceExtension to "ogg"}]
+      then const [conversion]
       else id
+    convertMusic = testExt musicExts [conversion]
+    copyMusic = testExt keepMusicExts [copy]
+    copyImages = testExt imageExts [copy]
 
-    convertMusic = testExt musicExts [Convert{from, to=replaceExtension to "ogg"}]
-    copyMusic = testExt keepMusicExts [Copy{from, to}]
-    copyImages = testExt imageExts [Copy{from, to}]
+splitCues :: Set Mapping -> Set Action
+splitCues mappings =
+  Set.map Map (mappings Set.\\ foundPairs) `Set.union`
+  Set.fromList (map Split splits)
+  where
+
+    flacsAndCueMaps :: Map FilePath Mapping
+    flacsAndCueMaps = Map.fromList $ do
+      m        <- Set.toList mappings
+      Just ext <- [extension (from m)]
+      guard (ext == "cue" || ext == "flac")
+      return (from m, m)
+
+    isFlacMapping f = extension (from f) == Just "flac"
+
+    flacMaps :: Map FilePath Mapping
+    cueMaps :: Map FilePath Mapping
+    (flacMaps, cueMaps) = Map.partition isFlacMapping flacsAndCueMaps
+
+    splits =
+      [ Splitter
+        { cue
+        , flac
+        , toDir = directory (to flac)
+        }
+      | cue <- Map.elems cueMaps
+      , flac <- case Map.lookup (replaceExtension (from cue) "flac") flacMaps of
+          Just r -> [r]
+          _      -> []
+      ]
+
+    foundPairs = Set.fromList (concatMap (\s -> [cue s, flac s]) splits)
 
 interpret :: Opts -> Action -> IO ()
-interpret _    (Copy from to)    = procs "cp" [f2t from, f2t to] mempty
-interpret opts (Convert from to) = proc
+interpret _    (Map Copy{from, to}) = procs "cp" [f2t from, f2t to] mempty
+interpret opts (Map Convert{from, to}) = proc
   "ffmpeg"
   [ "-loglevel", "quiet"
   , "-i" , f2t from
@@ -115,7 +169,49 @@ interpret opts (Convert from to) = proc
   , f2t to
   ] mempty >>= \case
   ExitSuccess   -> return ()
-  ExitFailure _ -> interpret opts (Copy from to)
+  ExitFailure _ -> interpret opts (Map Copy{from, to})
+interpret opts (Split Splitter{cue, flac, toDir}) =
+  withSystemTempDirectory "shrinkmusic" $ \tmpl -> do
+  -- Even if the cue file is left "dangling" at the end of this, we still
+  -- include it in the output, just so that the "evidence" of the splitting
+  -- remains, so shrinkmusic doesn't try to duplicate work on a second
+  -- invocation
+  --
+  -- Since media players might be confused by a cue file referring to a flac
+  -- that doesn't exist, we rename it to %f.cue.split, if and only if we succeed
+  -- in doing the cue split.
+  let !tmpf = decodeString tmpl
+  proc "shnsplit"
+    [ "-f", f2t (from cue)
+    , "-o", "flac", f2t (from flac)
+    , "-t", "%n %t"
+    , "-d", T.pack tmpl
+    ] mempty
+    >>= \case
+
+    ExitSuccess -> do
+      flacOuts <- lstree tmpf `Turtle.fold` F.list >>= filterM testfile
+      cueOk    <- proc "cuetag.sh" (f2t (from cue):map f2t flacOuts) mempty
+      case cueOk of
+        ExitSuccess   -> return ()
+        ExitFailure _ -> printf ("Warning: cuetag.sh failed for " % fp % "\n") (from cue)
+
+      interpret opts (Map cue{to=to cue <.> "split"})
+
+      mapM_ (interpret opts)
+        [ Map Convert
+          { from=out
+          , to=toDir </> replaceExtension (filename out) "ogg"
+          }
+        | out <- flacOuts
+        ]
+
+    ExitFailure _ -> do
+      -- flac is probably reasonably compressable when it's a giant file, less
+      -- gain to be had by converting one big flac rather than lots of littler
+      -- ones
+      interpret opts (Map cue)
+      interpret opts (Map flac)
 
 mapBadChars :: FilePath -> FilePath
 mapBadChars orig =
@@ -156,14 +252,19 @@ main = do
       exact
       noLabel
       40
-      Progress{ progressDone = toInteger (fromEnum (pp :: PlanPhase))
-              , progressTodo = toInteger (fromEnum (maxBound :: PlanPhase)) }
+      Progress
+      { progressDone = toInteger (fromEnum (pp :: PlanPhase))
+      , progressTodo = toInteger (fromEnum (maxBound :: PlanPhase))
+      }
 
   planProgress ReadingFiles
   inFiles <- lstree input `Turtle.fold` F.list >>= filterM testfile
 
-  let actions0 = concatMap (decide opts) inFiles
-  let targets = Set.fromList (map to actions0)
+  let mappings = concatMap (decideMappings opts) inFiles
+  let targets = Set.fromList
+                (concatMap
+                 (\s -> to s:[to s <.> "split" | extension (to s) == Just "cue" ])
+                 mappings)
 
   -- find where files were deleted from original folder i.e., the files in the
   -- destination folder that are not accounted for by the action plan
@@ -176,8 +277,9 @@ main = do
   -- scans; stuff i don't care about for my phone)
   planProgress FilteringNonMusicalDirectories
 
-  let dirs2targets = Map.fromListWith Set.union
-                     (map ((directory &&& Set.singleton) . to) actions0)
+  let dirs2targets =
+        Map.fromListWith Set.union
+        (map ((directory &&& Set.singleton) . to) mappings)
   let isMusicOrSubdir p =
         mkTestExt (extension p) musicExts True False ||
         directory p == p
@@ -185,12 +287,13 @@ main = do
         Map.filter (not . any isMusicOrSubdir) dirs2targets
 
   planProgress CreatingActions
-  actions <- filterM
+
+  actions <- Set.toList . splitCues . Set.fromList <$> filterM
     (\p -> do
         -- filter out where the destination file already exists
         alreadyExists <- testfile (to p)
         return (not alreadyExists && directory (to p) `Map.notMember` nonmusicdirs))
-    actions0
+    mappings
 
   planProgress Done
 
@@ -199,22 +302,29 @@ main = do
     then do
       -- forM_ (Map.keys nonmusicdirs) $ printf ("ignore dir: " % fp % "\n")
       -- forM_ deletes $ printf ("delete:     " % fp % "\n")
-      forM_ actions $ printf (fp % "\n") . from
-      {-
-      \case
-        Copy{from, to}    -> printf fp from
-        Convert{from, to} -> printf fp from
--}
+      forM_ actions $ \case
+        Map Copy{to}        -> printf ("copy " % fp % "\n") to
+        Map Convert{to}     -> printf ("convert " % fp % "\n") to
+        Split Splitter{cue} -> printf ("split " % fp % "\n") (from cue)
+      printf "\nSUMMARY\n"
+      printf ("total actions: " % d % "\n") (length actions)
+      printf ("total converts: " % d % "\n")
+             (length (filter (\case { Map Convert{} -> True; _ -> False }) actions))
+      printf ("total copies: " % d % "\n")
+             (length (filter (\case { Map Copy{} -> True; _ -> False }) actions))
+      printf ("total cue splits: " % d % "\n")
+             (length (filter (\case { Split{} -> True; _ -> False }) actions))
 
     else do
       putStrLn "making directory tree..."
-      mapM_ (mktree . directory . to) actions
-
-
+      mapM_
+        (\case
+            Map m -> mktree (directory (to m))
+            Split s -> mktree (toDir s))
+        actions
       unless (Set.null deletes) $ do
         putStrLn "running deletes..."
         mapM_ rm deletes
-
       putStrLn "converting..."
       (progRef, _) <- startProgress
         exact
@@ -246,7 +356,6 @@ main = do
               { progressDone = progressDone (convprogress c) + 1
               }
             }
-
       withPool jobs (\pool -> parallel_ pool (map step actions))
 
 playlistExts :: Set.Set Text
@@ -263,7 +372,7 @@ musicExts = Set.fromList
 
 keepMusicExts :: Set.Set Text
 keepMusicExts = Set.fromList
-  ["ogg", "mp3", "opus", "aac", "mp2", "mp1"]
+  [ "ogg", "mp3", "opus", "aac", "mp2", "mp1", "cue" ]
 
 imageExts :: Set.Set Text
 imageExts = Set.fromList

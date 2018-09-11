@@ -9,6 +9,7 @@ import           Control.Arrow                       ((&&&))
 import           Control.Concurrent.ParallelIO.Local
 import qualified Control.Foldl                       as F
 import           Control.Monad.State.Strict
+import           Data.List                           (foldl')
 import           Data.Map.Strict                     (Map)
 import qualified Data.Map.Strict                     as Map
 import           Data.Set                            (Set)
@@ -24,13 +25,14 @@ import qualified Text.Printf                         as P
 import           Turtle                              (ExitCode (..), FilePath,
                                                       between, choice, contains,
                                                       d, date, decodeString,
-                                                      directory, encodeString,
-                                                      extension, filename, fp,
-                                                      lstree, match, mktree,
-                                                      optInt, optPath, optText,
-                                                      option, options, printf,
-                                                      proc, procs, rm, suffix,
-                                                      switch, testdir, testfile,
+                                                      directory, du,
+                                                      encodeString, extension,
+                                                      filename, fp, lstree,
+                                                      match, mktree, optInt,
+                                                      optPath, optText, option,
+                                                      options, printf, proc,
+                                                      procs, rm, suffix, switch,
+                                                      sz, testdir, testfile,
                                                       (%), (<.>), (</>))
 import qualified Turtle
 
@@ -319,20 +321,30 @@ main = do
   start0 <- date
   if dryRun
     then do
-      -- forM_ (Map.keys nonmusicdirs) $ printf ("ignore dir: " % fp % "\n")
-      -- forM_ deletes $ printf ("delete:     " % fp % "\n")
       forM_ actions $ \case
         Map Copy{to}        -> printf ("copy " % fp % "\n") to
         Map Convert{to}     -> printf ("convert " % fp % "\n") to
         Split Splitter{cue} -> printf ("split " % fp % "\n") (from cue)
+
+      let copies = filter (\case {Map Copy{} -> True; _ -> False}) actions
+      let converts = filter (\case {Map Convert{} -> True; _ -> False}) actions
+      let splits = filter (\case {Split{} -> True; _ -> False}) actions
+      let sizeOf f = foldl' (+) 0 <$> mapM du
+            (do a <- f
+                case a of
+                  Map m                     -> [from m]
+                  Split Splitter{flac, cue} -> [from flac, from cue])
+
+      totalInputFileSize <- sizeOf actions
+      totalCopySize <- sizeOf copies
+      totalConvertSize <- sizeOf converts
+      totalSplitSize <- sizeOf splits
+
       printf "\nSUMMARY\n"
-      printf ("total actions: " % d % "\n") (length actions)
-      printf ("total converts: " % d % "\n")
-             (length (filter (\case { Map Convert{} -> True; _ -> False }) actions))
-      printf ("total copies: " % d % "\n")
-             (length (filter (\case { Map Copy{} -> True; _ -> False }) actions))
-      printf ("total cue splits: " % d % "\n")
-             (length (filter (\case { Split{} -> True; _ -> False }) actions))
+      printf ("Actions:   \t" % d % "\t" % sz % "\n") (length actions) totalInputFileSize
+      printf ("Converts:  \t" % d % "\t" % sz % "\n") (length converts) totalCopySize
+      printf ("Copies:    \t" % d % "\t" % sz % "\n") (length copies) totalConvertSize
+      printf ("Cue splits:\t" % d % "\t" % sz % "\n") (length splits) totalSplitSize
 
     else do
       putStrLn "making directory tree..."

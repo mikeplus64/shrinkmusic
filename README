@@ -10,6 +10,7 @@ collection onto a less large SD card for use on Android.
 
 ## Features
 - Has a dry run mode
+- Skips pre-existing files (e.g., to update collection on your SD card)
 - Attempts to determine whether conversion is worthwhile or not (e.g., for any
   old .mp3, it probably isn't...)
 - Supports selective ignoring of files/directories

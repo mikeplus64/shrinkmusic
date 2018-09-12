@@ -16,6 +16,7 @@ import           Data.Set                            (Set)
 import qualified Data.Set                            as Set
 import           Data.Text                           (Text)
 import qualified Data.Text                           as T
+import qualified Data.Text.Read                      as T
 import           Data.Time
 import           Filesystem.Path.CurrentOS           (replaceExtension)
 import           Prelude                             hiding (FilePath)
@@ -27,13 +28,14 @@ import           Turtle                              (ExitCode (..), FilePath,
                                                       d, date, decodeString,
                                                       directory, du,
                                                       encodeString, extension,
-                                                      filename, fp, lstree,
-                                                      match, mktree, optInt,
-                                                      optPath, optText, option,
-                                                      options, printf, proc,
-                                                      procs, rm, suffix, switch,
-                                                      sz, testdir, testfile,
-                                                      (%), (<.>), (</>))
+                                                      filename, fp, inproc,
+                                                      lineToText, lstree, match,
+                                                      mktree, optInt, optPath,
+                                                      optText, option, options,
+                                                      printf, proc, procs, rm,
+                                                      suffix, switch, sz,
+                                                      testdir, testfile, (%),
+                                                      (<.>), (</>))
 import qualified Turtle
 
 data Opts = Opts
@@ -78,32 +80,42 @@ mkTestExt thing exts y n = case thing of
   Just ext | Set.member (T.toLower ext) exts -> y
   _                                          -> n
 
-decideMappings :: Opts -> FilePath -> [Mapping]
+decideMappings :: Opts -> FilePath -> IO [Mapping]
 decideMappings Opts{input, output, ignores} from
   = respectIgnores
   . ignoreDot (encodeString from)
   . ignoreDot (encodeString (filename from))
   . ignorePlaylists
   . convert320mp3dir
+  . convert320mp3
   . copyMusic
   . convertMusic
   . copyImages
-  $ []
+  $ return []
   where
+    finish :: a -> b -> IO a
+    finish x _ = return x
+
+    continue :: IO a -> IO a
+    continue = id
+
     respectIgnores =
       if Set.member from ignores
-      then const []
-      else id
+      then finish []
+      else continue
 
-    testExt exts r = mkTestExt ext exts (const r) id
+    testExt exts r = mkTestExt ext exts (finish r) id
     ext = Turtle.extension from
     dir = T.toLower (f2t (Turtle.directory from))
     to = case Turtle.stripPrefix input from of
       Just relpath -> output </> mapBadChars relpath
       Nothing      -> error $ "could not extract prefix from " ++ show from
-    ignoreDot ('.':_) = const []
-    ignoreDot _       = id
+
+    ignoreDot ('.':_) = finish []
+    ignoreDot _       = continue
+
     ignorePlaylists = testExt playlistExts []
+
     bitrate320dir =
       contains (choice
                 [ between "(" ")" bitrate320
@@ -111,6 +123,7 @@ decideMappings Opts{input, output, ignores} from
                 , "@" >> bitrate320
                 ]) <|>
       suffix bitrate320
+
     bitrate320 = do
       _ <- "320"
       option $ choice
@@ -119,12 +132,32 @@ decideMappings Opts{input, output, ignores} from
         , "kbs"
         , "k"
         ]
+
     conversion = Convert{from, to=replaceExtension to "ogg"}
+
     copy = Copy{from, to}
+
     convert320mp3dir =
       if ext == Just "mp3" && not (null (match bitrate320dir dir))
-      then const [conversion]
-      else id
+      then finish [conversion]
+      else continue
+
+    convert320mp3 cont =
+      if ext == Just "mp3"
+      then do
+        br <- fmap (T.decimal . lineToText) <$> inproc "ffprobe"
+          [ "-v", "error"
+          , "-select_streams", "a:0"
+          , "-show_entries", "stream=bit_rate"
+          , "-of", "default=noprint_wrappers=1:nokey=1"
+          , f2t from
+          ] mempty `Turtle.fold` F.head
+        case br of
+          Just (Right (bitrate, _)) | (bitrate::Int) >= 256000 -> return [conversion]
+          _                                                    -> cont
+      else
+        cont
+
     convertMusic = testExt musicExts [conversion]
     copyMusic = testExt keepMusicExts [copy]
     copyImages = testExt imageExts [copy]
@@ -280,8 +313,7 @@ main = do
 
   planProgress ReadingFiles
   inFiles <- lstree input `Turtle.fold` F.list >>= filterM testfile
-
-  let mappings = concatMap (decideMappings opts) inFiles
+  mappings <- concat <$> mapM (decideMappings opts) inFiles
   let targets = Set.fromList
                 (concatMap
                  (\s -> to s:[to s <.> "split" | extension (to s) == Just "cue" ])
@@ -342,8 +374,8 @@ main = do
 
       printf "\nSUMMARY\n"
       printf ("Actions:   \t" % d % "\t" % sz % "\n") (length actions) totalInputFileSize
-      printf ("Converts:  \t" % d % "\t" % sz % "\n") (length converts) totalCopySize
-      printf ("Copies:    \t" % d % "\t" % sz % "\n") (length copies) totalConvertSize
+      printf ("Converts:  \t" % d % "\t" % sz % "\n") (length converts) totalConvertSize
+      printf ("Copies:    \t" % d % "\t" % sz % "\n") (length copies) totalCopySize
       printf ("Cue splits:\t" % d % "\t" % sz % "\n") (length splits) totalSplitSize
 
     else do

@@ -17,7 +17,8 @@ import qualified Data.Set                            as Set
 import           Data.Text                           (Text)
 import qualified Data.Text                           as T
 import           Data.Time
-import           Filesystem.Path.CurrentOS           (replaceExtension)
+import           Filesystem.Path.CurrentOS           (dropExtension,
+                                                      replaceExtension)
 import           Prelude                             hiding (FilePath)
 import           System.IO.Temp                      (withSystemTempDirectory)
 import           System.ProgressBar.State
@@ -170,7 +171,7 @@ splitCues mappings =
 interpret :: FilePath -> Opts -> Action -> IO [FsAction]
 interpret _ _ (Map Copy{from, to}) =
   return [FsCopy{fsfrom=from, fsto=to}]
-interpret tout opts (Map Convert{from, to}) = proc
+interpret tout' opts (Map Convert{from, to}) = proc
   "ffmpeg"
   [ "-loglevel", "quiet"
   , "-i" , f2t from
@@ -183,12 +184,9 @@ interpret tout opts (Map Convert{from, to}) = proc
   , "-n"
   , f2t tout
   ] mempty >>= \case
-
-  ExitSuccess   ->
-    return [FsMove{fsfrom=tout, fsto=to}]
-
-  ExitFailure _ ->
-    return [FsCopy{fsfrom=tout, fsto=to}]
+  ExitSuccess   -> return [FsMove{fsfrom=tout, fsto=to}]
+  ExitFailure _ -> return [FsCopy{fsfrom=from, fsto=to}]
+  where tout = replaceExtension tout' "ogg"
 
 interpret tmpf opts (Split Splitter{cue, flac, toDir}) = do
   mktree tmpf
@@ -205,23 +203,23 @@ interpret tmpf opts (Split Splitter{cue, flac, toDir}) = do
     , "-o", "flac", f2t (from flac)
     , "-t", "%n %t"
     , "-d", f2t tmpf
+    , "-q"
     ] mempty
     >>= \case
 
     ExitSuccess -> do
-      flacOuts <- lstree tmpf `Turtle.fold` F.list >>= filterM testfile
-      cueOk    <- proc "cuetag.sh" (f2t (from cue):map f2t flacOuts) mempty
+      splitFlacs <- lstree tmpf `Turtle.fold` F.list >>= filterM testfile
+      cueOk      <- proc "cuetag.sh" (f2t (from cue):map f2t splitFlacs) mempty
       case cueOk of
         ExitSuccess   -> return ()
         ExitFailure _ -> printf ("Warning: cuetag.sh failed for " % fp % "\n") (from cue)
 
       (FsCopy{fsfrom=from cue, fsto=to cue} :) . concat <$> sequence
-        [ interpret tout opts (Map Convert
-          { from=flacOut
-          , to=toDir </> replaceExtension (filename flacOut) "ogg"
+        [ interpret (tmpf </> dropExtension splitFlac) opts (Map Convert
+          { from=splitFlac
+          , to=toDir </> replaceExtension (filename splitFlac) "ogg"
           })
-        | (i, flacOut) <- zip [0 :: Int ..] flacOuts
-        , let tout = tmpf </> decodeString (show i)
+        | splitFlac <- splitFlacs
         ]
 
     ExitFailure _ ->
@@ -410,12 +408,7 @@ main = do
           | (i, act) <- zip [0 :: Int ..] actions
           , let tmpf = ftempOutDir </> decodeString (show i)
           ]
-        print (length fsActs)
-        mapM_ (\fs -> do
-                  putChar '\n'
-                  print fs
-                  putChar '\n'
-                  interpretFs fs) fsActs
+        mapM_ interpretFs fsActs
 
 playlistExts :: Set.Set Text
 playlistExts = Set.fromList

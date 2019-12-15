@@ -3,8 +3,8 @@
   nixpkgs ? import ((import <nixpkgs> config).fetchFromGitHub {
     owner = "NixOS";
     repo = "nixpkgs-channel";
-    rev = "6f3bd5db2f4d1f8bf21631ebe56f496114637c56";
-    sha256 = "1izdsqiyxb1bn9a4xl06hh14xhcc2rhcqcqfxwpf4q5i1q32bw5d";
+    rev = "54f385241e6649128ba963c10314942d73245479";
+    sha256 = "0bd4v8v4xcdbaiaa59yqprnc6dkb9jv12mb0h5xz7b51687ygh9l";
   }) config,
   compiler ? "default"
 }:

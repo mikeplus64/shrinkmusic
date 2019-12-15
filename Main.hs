@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns          #-}
+{-# LANGUAGE BlockArguments        #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE NamedFieldPuns        #-}
@@ -16,45 +17,40 @@ import           Data.Set                            (Set)
 import qualified Data.Set                            as Set
 import           Data.Text                           (Text)
 import qualified Data.Text                           as T
+import qualified Data.Text.Lazy                      as TL
 import qualified Data.Text.Read                      as T
 import           Data.Time
 import           Filesystem.Path.CurrentOS           (replaceExtension)
 import           Prelude                             hiding (FilePath)
 import           System.IO.Temp                      (withSystemTempDirectory)
-import           System.ProgressBar.State
+import qualified System.IO as IO (hSetEncoding, stdout, stderr, utf8)
+import           System.ProgressBar
 import qualified Text.Printf                         as P
 import           Turtle                              (ExitCode (..), FilePath,
                                                       between, choice, contains,
                                                       d, date, decodeString,
                                                       directory, du,
                                                       encodeString, extension,
-                                                      filename, fp, inproc,
-                                                      lineToText, lstree, match,
-                                                      mktree, optInt, optPath,
-                                                      optText, option, options,
-                                                      printf, proc, procs, rm,
-                                                      suffix, switch, sz,
-                                                      testdir, testfile, (%),
-                                                      (<.>), (</>))
+                                                      filename, fp,
+                                                      inprocWithErr, lineToText,
+                                                      lstree, match, mktree,
+                                                      optInt, optPath, optText,
+                                                      option, options, printf,
+                                                      proc, procs, rm, suffix,
+                                                      switch, sz, testdir,
+                                                      testfile, (%), (</>))
 import qualified Turtle
+import GHC.IO.Encoding (setLocaleEncoding, utf8)
 
 data Opts = Opts
-  { input   :: !FilePath
-  , output  :: !FilePath
-  , bitrate :: !Text
-  , jobs    :: !Int
-  , ignores :: !(Set FilePath)
-  , dryRun  :: !Bool
+  { input             :: !FilePath
+  , output            :: !FilePath
+  , bitrate           :: !Text
+  , jobs              :: !Int
+  , ignores           :: !(Set FilePath)
+  , dryRun            :: !Bool
+  , overwriteExisting :: !Bool
   }
-
-data ConvertProgress = ConvertProgress
-  { start        :: {-# UNPACK #-} !UTCTime
-  , now          :: {-# UNPACK #-} !UTCTime
-  , convprogress :: {-# UNPACK #-} !Progress
-  }
-
-instance HasProgress ConvertProgress where
-  getProgress = convprogress
 
 f2t :: FilePath -> Text
 f2t = either id id . Turtle.toText
@@ -87,7 +83,6 @@ decideMappings Opts{input, output, ignores} from
   . ignoreDot (encodeString (filename from))
   . ignorePlaylists
   . convert320mp3dir
-  . convert320mp3
   . copyMusic
   . convertMusic
   . copyImages
@@ -142,25 +137,23 @@ decideMappings Opts{input, output, ignores} from
       then finish [conversion]
       else continue
 
-    convert320mp3 cont =
-      if ext == Just "mp3"
-      then do
-        br <- fmap (T.decimal . lineToText) <$> inproc "ffprobe"
-          [ "-v", "error"
-          , "-select_streams", "a:0"
-          , "-show_entries", "stream=bit_rate"
-          , "-of", "default=noprint_wrappers=1:nokey=1"
-          , f2t from
-          ] mempty `Turtle.fold` F.head
-        case br of
-          Just (Right (bitrate, _)) | (bitrate::Int) >= 256000 -> return [conversion]
-          _                                                    -> cont
-      else
-        cont
-
     convertMusic = testExt musicExts [conversion]
     copyMusic = testExt keepMusicExts [copy]
     copyImages = testExt imageExts [copy]
+
+{-
+bitrateOf f = do
+  br <- fmap (T.decimal . lineToText . either id id) <$> inprocWithErr "ffprobe"
+    [ "-v", "quiet"
+    , "-select_streams", "a:0"
+    , "-show_entries", "stream=bit_rate"
+    , "-of", "default=noprint_wrappers=1:nokey=1"
+    , f2t f
+    ] mempty `Turtle.fold` F.head
+  case br of
+    Just (Right (bitrate, _)) -> return (bitrate :: Int)
+    err                       -> error (show err)
+-}
 
 splitCues :: Set Mapping -> Set Action
 splitCues mappings =
@@ -199,7 +192,7 @@ interpret :: Opts -> Action -> IO ()
 interpret _    (Map Copy{from, to}) = procs "cp" [f2t from, f2t to] mempty
 interpret opts (Map Convert{from, to}) = proc
   "ffmpeg"
-  [ "-loglevel", "quiet"
+  [ "-loglevel", "error"
   , "-i" , f2t from
   , "-vn"
   , "-codec:a", "libopus"
@@ -228,6 +221,7 @@ interpret opts (Split Splitter{cue, flac, toDir}) =
     , "-o", "flac", f2t (from flac)
     , "-t", "%n %t"
     , "-d", T.pack tmpl
+    , "-q"
     ] mempty
     >>= \case
 
@@ -238,12 +232,12 @@ interpret opts (Split Splitter{cue, flac, toDir}) =
         ExitSuccess   -> return ()
         ExitFailure _ -> printf ("Warning: cuetag.sh failed for " % fp % "\n") (from cue)
 
-      interpret opts (Map cue{to=to cue <.> "split"})
+      interpret opts (Map cue{to=to cue})
 
       mapM_ (interpret opts)
         [ Map Convert
           { from=out
-          , to=toDir </> replaceExtension (filename out) "ogg"
+          , to=toDir </> replaceExtension (mapBadChars (filename out)) "ogg"
           }
         | out <- flacOuts
         ]
@@ -261,7 +255,7 @@ mapBadChars orig =
   then orig
   else decodeString (concatMap unbad str)
   where
-    bads = "?<>\\|" :: String
+    bads = "\"'?<>\\|" :: String
     unbad '|' = ")"
     unbad c   = if c `elem` bads then [] else [c]
     str = encodeString orig
@@ -275,9 +269,19 @@ data PlanPhase
   | Done
   deriving (Show, Eq, Ord, Enum, Bounded)
 
+data ConvertProgress = ConvertProgress
+  { start :: {-# UNPACK #-} !UTCTime
+  , now   :: {-# UNPACK #-} !UTCTime
+  }
+
 main :: IO ()
 main = do
-  opts0@Opts{input, output, jobs, dryRun, ignores} <- options "shrinkmusic" $ Opts
+  -- setLocaleEncoding utf8
+  --
+  IO.hSetEncoding IO.stdout IO.utf8
+  IO.hSetEncoding IO.stderr IO.utf8
+
+  opts0@Opts{input, output, jobs, dryRun, ignores, overwriteExisting} <- options "shrinkmusic" $ Opts
     <$> fmap (</> "") (optPath "input" 'i' "Input directory")
     <*> fmap (</> "") (optPath "output" 'o' "Output directory")
     <*> optText "bitrate" 'b' "bitrate for audio"
@@ -285,13 +289,17 @@ main = do
     <*> (Set.fromList `fmap` many (optPath "ignore" 'z' "Ignore this file") <|>
          pure Set.empty)
     <*> switch "dry-run" 'd' "Do nothing; just output the plan"
+    <*> switch "overwrite-existing" 'X' "Overwrite existing files in the destination."
 
   ignoreRecur <- fmap (Set.fromList . concat) . forM (Set.toList ignores) $
     \i -> do
       isDir <- testdir i
       if isDir
-        then lstree i `Turtle.fold` F.list >>= filterM testfile
-        else return [i]
+        then do
+          yall <- lstree i `Turtle.fold` F.list
+          filterM testfile yall
+        else
+          return [i]
 
   let opts = opts0{ignores=ignoreRecur}
 
@@ -299,25 +307,29 @@ main = do
 
   putStrLn "constructing plan..."
 
+  planPP <- newProgressBar
+    defStyle
+    { stylePrefix = Label \Progress{progressCustom} _ ->
+        TL.pack (show progressCustom)
+    }
+    15
+    Progress
+    { progressDone = fromIntegral (fromEnum (minBound :: PlanPhase))
+    , progressTodo = fromIntegral (fromEnum (maxBound :: PlanPhase))
+    , progressCustom = minBound :: PlanPhase
+    }
+
   let
     planProgress :: PlanPhase -> IO ()
-    planProgress pp =
-      (autoProgressBar :: ProgressBar Progress (IO ()))
-      exact
-      noLabel
-      40
-      Progress
-      { progressDone = toInteger (fromEnum (pp :: PlanPhase))
-      , progressTodo = toInteger (fromEnum (maxBound :: PlanPhase))
+    planProgress pp = updateProgress planPP \prog -> prog
+      { progressDone = fromIntegral (fromEnum pp)
+      , progressCustom = pp
       }
 
   planProgress ReadingFiles
   inFiles <- lstree input `Turtle.fold` F.list >>= filterM testfile
   mappings <- concat <$> mapM (decideMappings opts) inFiles
-  let targets = Set.fromList
-                (concatMap
-                 (\s -> to s:[to s <.> "split" | extension (to s) == Just "cue" ])
-                 mappings)
+  let targets = Set.fromList (map to mappings)
 
   -- find where files were deleted from original folder i.e., the files in the
   -- destination folder that are not accounted for by the action plan
@@ -342,10 +354,13 @@ main = do
   planProgress CreatingActions
 
   actions <- Set.toList . splitCues . Set.fromList <$> filterM
-    (\p -> do
-        -- filter out where the destination file already exists
-        alreadyExists <- testfile (to p)
-        return (not alreadyExists && directory (to p) `Map.notMember` nonmusicdirs))
+    (\p ->
+        if not overwriteExisting
+        then do
+          -- filter out where the destination file already exists
+          alreadyExists <- testfile (to p)
+          pure (not alreadyExists && directory (to p) `Map.notMember` nonmusicdirs)
+        else pure True)
     mappings
 
   planProgress Done
@@ -389,36 +404,36 @@ main = do
         putStrLn "running deletes..."
         mapM_ rm deletes
       putStrLn "converting..."
-      (progRef, _) <- startProgress
-        exact
-        (\ConvertProgress{ convprogress=Progress{progressDone, progressTodo}, start
-                         , now } ->
+      convertPP <- newProgressBar defStyle
+        { stylePostfix = Label \Progress{progressDone, progressTodo, progressCustom=ConvertProgress{start, now}} _ ->
           let
             elapsed, avg, remain :: Double
             elapsed = realToFrac (diffUTCTime now start)
-            avg = elapsed / fromInteger progressDone
-            remain = avg * fromInteger (progressTodo - progressDone)
-          in P.printf "%.2fs elapsed. %0.2fs remaining" elapsed remain)
-        40
-        ConvertProgress
-        { start = start0
-        , now = start0
-        , convprogress = Progress
-          { progressDone = 0
-          , progressTodo = toInteger (length actions)
-          }
+            avg = elapsed / fromIntegral progressDone
+            remain = avg * fromIntegral (progressTodo - progressDone)
+          in
+            TL.pack (P.printf "%.2fs elapsed. %0.2fs remaining" elapsed remain)
         }
+        15
+        Progress
+        { progressCustom = ConvertProgress
+          { start = start0
+          , now = start0
+          }
+        , progressDone = 0
+        , progressTodo = fromIntegral (length actions)
+        }
+
       let
         step :: Action -> IO ()
         step action = do
           interpret opts action
           now <- date
-          incProgress progRef $ \c -> c
-            { now
-            , convprogress = (convprogress c)
-              { progressDone = progressDone (convprogress c) + 1
-              }
+          updateProgress convertPP \c -> c
+            { progressCustom = (progressCustom c){now}
+            , progressDone = progressDone c + 1
             }
+
       withPool jobs (\pool -> parallel_ pool (map step actions))
 
 playlistExts :: Set.Set Text

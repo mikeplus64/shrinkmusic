@@ -3,10 +3,10 @@
   nixpkgs ? import ((import <nixpkgs> config).fetchFromGitHub {
     owner = "NixOS";
     repo = "nixpkgs-channel";
-    rev = "54f385241e6649128ba963c10314942d73245479";
-    sha256 = "0bd4v8v4xcdbaiaa59yqprnc6dkb9jv12mb0h5xz7b51687ygh9l";
+    rev = "502845c3e31ef3de0e424f3fcb09217df2ce6df6";
+    sha256 = "0fcqpsy6y7dgn0y0wgpa56gsg0b0p8avlpjrd79fp4mp9bl18nda";
   }) config,
-  compiler ? "default"
+  compiler ? "ghc8102"
 }:
 let
   inherit (nixpkgs) pkgs;

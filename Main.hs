@@ -10,7 +10,7 @@ import           Control.Arrow                       ((&&&))
 import           Control.Concurrent.ParallelIO.Local
 import qualified Control.Foldl                       as F
 import           Control.Monad.State.Strict
-import           Data.List                           (foldl')
+import           Data.List                           (foldl', sort)
 import           Data.Map.Strict                     (Map)
 import qualified Data.Map.Strict                     as Map
 import           Data.Set                            (Set)
@@ -43,13 +43,15 @@ import qualified Turtle
 import GHC.IO.Encoding (setLocaleEncoding, utf8)
 
 data Opts = Opts
-  { input             :: !FilePath
-  , output            :: !FilePath
-  , bitrate           :: !Text
-  , jobs              :: !Int
-  , ignores           :: !(Set FilePath)
-  , dryRun            :: !Bool
-  , overwriteExisting :: !Bool
+  { input              :: !FilePath
+  , output             :: !FilePath
+  , bitrate            :: !Text
+  , jobs               :: !Int
+  , ignores            :: !(Set FilePath)
+  , dryRun             :: !Bool
+  , overwriteExisting  :: !Bool
+  , convertAll         :: !Bool
+  , outputFormat       :: !Text
   }
 
 f2t :: FilePath -> Text
@@ -77,14 +79,15 @@ mkTestExt thing exts y n = case thing of
   _                                          -> n
 
 decideMappings :: Opts -> FilePath -> IO [Mapping]
-decideMappings Opts{input, output, ignores} from
+decideMappings Opts{input, output, ignores, convertAll, outputFormat} from
   = respectIgnores
   . ignoreDot (encodeString from)
   . ignoreDot (encodeString (filename from))
   . ignorePlaylists
-  . convert320mp3dir
-  . copyMusic
-  . convertMusic
+  . (if convertAll
+     then convertMusic
+     else convert320mp3dir . copyMusic . convertMusic)
+  . copyCue
   . copyImages
   $ return []
   where
@@ -99,9 +102,10 @@ decideMappings Opts{input, output, ignores} from
       then finish []
       else continue
 
-    testExt exts r = mkTestExt ext exts (finish r) id
+    testExt exts r = mkTestExt ext exts (finish r) continue
     ext = Turtle.extension from
     dir = T.toLower (f2t (Turtle.directory from))
+    base = T.toLower (f2t (Turtle.basename from))
     to = case Turtle.stripPrefix input from of
       Just relpath -> output </> mapBadChars relpath
       Nothing      -> error $ "could not extract prefix from " ++ show from
@@ -111,12 +115,10 @@ decideMappings Opts{input, output, ignores} from
 
     ignorePlaylists = testExt playlistExts []
 
-    bitrate320dir =
-      contains (choice
-                [ between "(" ")" bitrate320
-                , between "[" "]" bitrate320
-                , "@" >> bitrate320
-                ]) <|>
+    bitrate320dir = contains
+      (choice
+        [ ("(" <|> "[" <|> "@") >> bitrate320
+        ]) <|>
       suffix bitrate320
 
     bitrate320 = do
@@ -128,7 +130,10 @@ decideMappings Opts{input, output, ignores} from
         , "k"
         ]
 
-    conversion = Convert{from, to=replaceExtension to "ogg"}
+    conversion = Convert
+      { from
+      , to = replaceExtension to (outputExtension outputFormat)
+      }
 
     copy = Copy{from, to}
 
@@ -139,8 +144,25 @@ decideMappings Opts{input, output, ignores} from
 
     convertMusic = testExt musicExts [conversion]
     copyMusic = testExt keepMusicExts [copy]
-    copyImages = testExt imageExts [copy]
+    
+    copyImages =
+      if maybe False (`Set.member` imageExts) ext && Set.member base coverImageFiles
+      then finish [copy]
+      else continue
 
+    copyCue =
+      if ext == Just "cue"
+      then finish [copy]
+      else continue
+
+outputExtension :: Text -> Text
+outputExtension format = case format of 
+  "mp3" -> "mp3"
+  "flac"  -> "flac"
+  "ogg" -> "ogg"
+  "opus" -> "ogg"
+  _ -> error "unknown format"
+  
 {-
 bitrateOf f = do
   br <- fmap (T.decimal . lineToText . either id id) <$> inprocWithErr "ffprobe"
@@ -157,7 +179,9 @@ bitrateOf f = do
 
 splitCues :: Set Mapping -> Set Action
 splitCues mappings =
-  Set.map Map (mappings Set.\\ foundPairs) `Set.union`
+  Set.map Map (Set.filter
+               (\m -> extension (to m) /= Just "cue")
+               (mappings Set.\\ foundPairs)) `Set.union`
   Set.fromList (map Split splits)
   where
 
@@ -189,22 +213,64 @@ splitCues mappings =
     foundPairs = Set.fromList (concatMap (\s -> [cue s, flac s]) splits)
 
 interpret :: Opts -> Action -> IO ()
-interpret _    (Map Copy{from, to}) = procs "cp" [f2t from, f2t to] mempty
-interpret opts (Map Convert{from, to}) = proc
-  "ffmpeg"
-  [ "-loglevel", "error"
-  , "-i" , f2t from
-  , "-vn"
-  , "-codec:a", "libopus"
-  , "-b:a", bitrate opts
-  , "-vbr", "on"
-  , "-compression_level", "10"
-  , "-map_metadata", "0:g"
-  , "-n"
-  , f2t to
-  ] mempty >>= \case
+interpret _    (Map Copy{from, to}) = void (proc "cp" [f2t from, f2t to] mempty)
+
+interpret opts (Map Convert{from, to})
+  | extension from == Just "flac" && extension to == Just "flac" =
+    interpret opts (Map Copy{from, to})
+    
+interpret opts (Map Convert{from, to}) = proc "ffmpeg" args mempty >>= \case
   ExitSuccess   -> return ()
   ExitFailure _ -> interpret opts (Map Copy{from, to})
+
+  where
+    args = case outputFormat opts of
+      "mp3" ->
+        [ "-loglevel", "error"
+        , "-i" , f2t from
+        , "-vn"
+        , "-codec:a", "libmp3lame"
+        , "-b:a", bitrate opts
+        , "-map_metadata", "0:g"
+        , "-n"
+        , f2t to
+        ]
+
+      "wma" ->
+        [ "-loglevel", "error"
+        , "-i" , f2t from
+        , "-vn"
+        , "-codec:a", "wmav2"
+        , "-b:a", bitrate opts
+        , "-vbr", "on"
+        , "-map_metadata", "0:g"
+        , "-n"
+        , f2t to
+        ]
+
+      "flac" ->
+         [ "-loglevel", "error"
+         , "-i" , f2t from
+         , "-vn"
+         , "-codec:a", "flac"
+         , "-map_metadata", "0:g"
+         , "-n"
+         , f2t to
+         ]
+
+      _ -> -- default to opus
+        [ "-loglevel", "error"
+        , "-i" , f2t from
+        , "-vn"
+        , "-codec:a", "libopus"
+        , "-b:a", bitrate opts
+        , "-vbr", "on"
+        , "-compression_level", "10"
+        , "-map_metadata", "0:g"
+        , "-n"
+        , f2t to
+        ]
+
 interpret opts (Split Splitter{cue, flac, toDir}) =
   withSystemTempDirectory "shrinkmusic" $ \tmpl -> do
   -- Even if the cue file is left "dangling" at the end of this, we still
@@ -226,8 +292,8 @@ interpret opts (Split Splitter{cue, flac, toDir}) =
     >>= \case
 
     ExitSuccess -> do
-      flacOuts <- lstree tmpf `Turtle.fold` F.list >>= filterM testfile
-      cueOk    <- proc "cuetag.sh" (f2t (from cue):map f2t flacOuts) mempty
+      flacOuts <- lstree tmpf `Turtle.fold` F.list >>= filterM testfile --
+      cueOk    <- proc "cuetag.sh" (f2t (from cue):sort (map f2t flacOuts)) mempty
       case cueOk of
         ExitSuccess   -> return ()
         ExitFailure _ -> printf ("Warning: cuetag.sh failed for " % fp % "\n") (from cue)
@@ -237,7 +303,7 @@ interpret opts (Split Splitter{cue, flac, toDir}) =
       mapM_ (interpret opts)
         [ Map Convert
           { from=out
-          , to=toDir </> replaceExtension (mapBadChars (filename out)) "ogg"
+          , to=toDir </> replaceExtension (mapBadChars (filename out)) (outputExtension (outputFormat opts))
           }
         | out <- flacOuts
         ]
@@ -276,8 +342,7 @@ data ConvertProgress = ConvertProgress
 
 main :: IO ()
 main = do
-  -- setLocaleEncoding utf8
-  --
+  setLocaleEncoding utf8
   IO.hSetEncoding IO.stdout IO.utf8
   IO.hSetEncoding IO.stderr IO.utf8
 
@@ -290,6 +355,8 @@ main = do
          pure Set.empty)
     <*> switch "dry-run" 'd' "Do nothing; just output the plan"
     <*> switch "overwrite-existing" 'X' "Overwrite existing files in the destination."
+    <*> switch "convert-all" 'C' "convert every single file"
+    <*> optText "output-format" 'f' "format for the outputs"
 
   ignoreRecur <- fmap (Set.fromList . concat) . forM (Set.toList ignores) $
     \i -> do
@@ -353,14 +420,31 @@ main = do
 
   planProgress CreatingActions
 
-  actions <- Set.toList . splitCues . Set.fromList <$> filterM
+  actions <-
+    Set.toList . splitCues . Set.fromList <$>
+    withPool jobs \pool ->
+    parallelFilterM pool
     (\p ->
-        if not overwriteExisting
-        then do
-          -- filter out where the destination file already exists
-          alreadyExists <- testfile (to p)
-          pure (not alreadyExists && directory (to p) `Map.notMember` nonmusicdirs)
-        else pure True)
+       if overwriteExisting
+       then pure True
+       else
+         not <$> or_
+         [
+           -- it already exists, and they're the same file (for copy actions)
+           and_
+           [ testfile (to p)
+           , case p of
+               Copy{from, to} -> do
+                 fs <- du from
+                 ts <- du to
+                 when (fs /= ts) (printf ("mismatch " % fp % " from " % fp % "\n") to from)
+                 pure (fs == ts)
+               _ ->
+                 pure False
+           ]
+           -- or, the directory is not a music directory
+         , pure (directory (to p) `Map.member` nonmusicdirs)
+         ])
     mappings
 
   planProgress Done
@@ -434,7 +518,8 @@ main = do
             , progressDone = progressDone c + 1
             }
 
-      withPool jobs (\pool -> parallel_ pool (map step actions))
+      withPool jobs \pool ->
+        parallel_ pool (map step actions)
 
 playlistExts :: Set.Set Text
 playlistExts = Set.fromList
@@ -468,3 +553,29 @@ imageExts = Set.fromList
   , "lbm", "liff", "nrrd", "pam", "pcx", "pgf", "sgi", "rgb", "rgba"
   , "bw", "int", "inta", "sid", "ras", "sun", "tga" ]
 
+coverImageFiles :: Set.Set Text
+coverImageFiles = Set.fromList ["album", "cover", "front", "artist"]
+
+--------------------------------------------------------------------------------
+
+or_ :: Monad m => [m Bool] -> m Bool
+or_ (fx:fxs) = do
+  x <- fx
+  if x then pure True else or_ fxs
+or_ [] = pure False
+
+and_ :: Monad m => [m Bool] -> m Bool
+and_ (fx:fxs) = do
+  x <- fx
+  if x then and_ fxs else pure False
+and_ [] = pure True
+
+parallelFilterM :: Pool -> (a -> IO Bool) -> [a] -> IO [a]
+parallelFilterM pool test xs
+  = map snd . filter fst <$>
+    parallel pool
+    [ do
+        ok <- test x
+        pure (ok, x)
+    | x <- xs
+    ]

@@ -1,19 +1,26 @@
 {
   config ? {},
-  nixpkgs ? import ((import <nixpkgs> config).fetchFromGitHub {
+  pkgs ? import ((import <nixpkgs> {}).fetchFromGitHub {
     owner = "NixOS";
-    repo = "nixpkgs-channel";
-    rev = "502845c3e31ef3de0e424f3fcb09217df2ce6df6";
-    sha256 = "0fcqpsy6y7dgn0y0wgpa56gsg0b0p8avlpjrd79fp4mp9bl18nda";
+    repo = "nixpkgs";
+    rev = "057f9aecfb71c4437d2b27d3323df7f93c010b7e";
+    sha256 = "MxCVrXY6v4QmfTwIysjjaX0XUhqBbxTWWB4HXtDYsdk=";
   }) config,
-  compiler ? "ghc8102"
+  shell ? false
 }:
 let
-  inherit (nixpkgs) pkgs;
-  haskellPackages =
-    if compiler == "default"
-    then pkgs.haskellPackages
-    else pkgs.haskell.packages.${compiler};
-  drv = haskellPackages.callCabal2nix "shrinkmusic" ./. {};
+  hp = pkgs.haskell.packages.ghc963;
+  lib = pkgs.haskell.lib;
 in
-  drv
+  hp.developPackage {
+    root = ./.;
+    returnShellEnv = shell;
+    withHoogle = false;
+    modifier = drv:
+      lib.overrideCabal drv (attrs: {
+        buildTools = (attrs.buildTools or [ ]) ++ [
+          hp.cabal-install
+          hp.haskell-language-server
+        ];
+      });
+  }

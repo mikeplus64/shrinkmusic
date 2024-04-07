@@ -8,7 +8,7 @@ data Rename = Rename
 bads :: Set Char
 bads = fromList "\"'?<>\\|:"
 
-mapBadChars :: OsString -> OsPath
+mapBadChars :: OsPath -> OsPath
 mapBadChars = OS.pack . concatMap (map OS.unsafeFromChar . unbad . OS.toChar) . OS.unpack
   where
     unbad :: Char -> [Char]

@@ -7,101 +7,117 @@ import Data.List qualified as List
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as Text
+import Data.Vector qualified as Vector
 import Effectful.Error.Static
 import ShrinkMusic.FileFormats
 import ShrinkMusic.Options
 import ShrinkMusic.PathMunge
-import ShrinkMusic.PathTree (F (..), fileTree)
+import ShrinkMusic.PathTree
 import Streaming qualified as S
 import Streaming.Prelude qualified as S
 import System.Directory.OsPath.FileType
 import System.Directory.OsPath.Streaming
 
-data Mapping
-  = Copy {from, to :: OsPath}
-  | Convert {from, to :: OsPath}
+--------------------------------------------------------------------------------
+
+data Action
+  = Copy {from :: TreePath, to :: OsPath}
+  | Convert {from :: TreePath, to :: OsPath}
+  | CueSplitAction {cue, flac :: TreePath, to :: OsPath}
   deriving stock (Show, Eq, Ord)
 
-newtype TrySplitCueFlacPair = TrySplitCueFlacPair {cue :: OsPath}
+newtype MappingError = CouldNotExtractPrefix [OsPath]
   deriving stock (Show, Eq, Ord)
 
-data SplitCueFlacPair = SplitCueFlacPair {cue, flac, to :: OsPath}
-  deriving stock (Show, Eq, Ord)
+makeFieldLabelsNoPrefix ''Action
 
-makeFieldLabelsNoPrefix ''Mapping
+data TreePathCheck = TreePathCheck
+  { tp :: TreePath
+  , isImage :: Bool
+  , isMusic :: Bool
+  , isCue :: Bool
+  }
 
-data MappingError
-  = CouldNotExtractPrefix OsPath
-  | UserIgnored OsPath
-  | IgnoreDotPaths OsPath
-  | IgnorePlaylists OsPath
-  | IgnoreUnknown OsPath
-  | EmptyPath OsPath
-  deriving stock (Show, Eq, Ord)
+makeFieldLabelsNoPrefix ''TreePathCheck
 
-decideMappings :: forall es. (HasOptions es, Log @> es, IOE @> es) => Eff es ()
-decideMappings = do
-  root <- option #input
-  pass1 <- S.toList_ (S.mapM (baseMapping @es) (fileTree root) `S.for` mapM_ S.yield)
-  let (cues', maps) = partitionEithers pass1
-  let byFrom x = ((x :: Mapping) ^. #from, x)
-  let mapsByFrom = Map.fromList (map byFrom maps)
-  let (cues, maps) = secondPass mapsByFrom cues'
-  mapM_ (logInfo_ . show) cues
-  mapM_ (logInfo_ . show) maps
+--------------------------------------------------------------------------------
 
-mapping1
-  :: ( HasOptions es
-     , Error MappingError @> es
-     , Error TrySplitCueFlacPair @> es
-     )
-  => F
-  -> Eff es Mapping
-mapping1 (F from split) = do
-  ignores <- option #ignores
-  output <- option #output
-  outputS <- option #outputSplit
+actions :: (HasOptions es, Log @> es, IOE @> es) => OsPath -> Stream (Of Action) (Eff es) ()
+actions root = streamVector do
+  overPathTree root (\path files -> lift (dirMappings path files) >>= S.yield)
+
+--------------------------------------------------------------------------------
+
+dirMappings
+  :: forall es
+   . (HasOptions es, Log @> es)
+  => TreePath
+  -> Vector TreePath
+  -> Eff es (Vector Action)
+dirMappings dir files0 = do
   inputS <- option #inputSplit
-  convertAll <- option #convertAll
-  outputFormat <- option #outputFormat
+  outputS <- option #outputSplit
   outputExtension <- option #outputExtension
-  errIf EmptyPath (null split)
-  let filename = List.last split
-  let (basename, ext) = splitExtension filename
-  errIf UserIgnored (ignores ^. contains split)
-  errIf IgnoreDotPaths (any (("." `Text.isInfixOf`) . toText) split)
-  errIf IgnorePlaylists (ext `Set.member` playlistExts)
-  copyPath <- case List.stripPrefix inputS split of
-    Just relpath -> pure (joinPath (outputS ++ map mapBadChars relpath))
-    Nothing -> throwError (CouldNotExtractPrefix from)
-  let ~convertPath = replaceExtension copyPath outputExtension
-  if
-    | ext == "cue" -> throwError TrySplitCueFlacPair {cue = from}
-    | ext `Set.member` imageExts && Set.member basename coverImageFiles -> pure Copy {from, to = copyPath}
-    | ext `Set.notMember` musicExts -> throwError (IgnoreUnknown copyPath)
-    | convertAll -> pure Convert {from, to = convertPath}
-    | otherwise -> do
-        shouldConvert <- determineIfShouldConvert from
-        pure $! if shouldConvert then Copy {from, to = copyPath} else Convert {from, to = convertPath}
-  where
-    errIf f cond = when cond (throwError (f from))
+  ignores <- option #ignores
+  let
+    files :: Vector TreePathCheck
+    files =
+      files0
+        & Vector.filter (\TreePath {components} -> not (ignores ^. contains components))
+        <&> \tp@TreePath {extension = ext, basename} ->
+          TreePathCheck
+            { tp
+            , isCue = ext == ".cue"
+            , isMusic = ext `Set.member` musicExts
+            , isImage = ext `Set.member` imageExts && basename `Set.member` coverImageFiles
+            }
 
-baseMapping :: (HasOptions es, Log @> es) => F -> Eff es (Maybe (Either TrySplitCueFlacPair Mapping))
-baseMapping fp =
-  runErrorNoCallStack @MappingError (runErrorNoCallStack @TrySplitCueFlacPair (mapping1 fp)) >>= \case
-    Left e -> Nothing <$ logInfo_ (show e)
-    Right x -> pure (Just x)
+    test check tpc@TreePathCheck {tp} = tp <$ guard (tpc ^. check)
+    fileNameMap vec = Map.fromList [(filename, f) | f@TreePath {filename} <- toList vec]
+    musicFiles = files & Vector.mapMaybe (test #isMusic) & fileNameMap
+    imageFiles = files & Vector.mapMaybe (test #isImage)
+    cueFiles = files & Vector.mapMaybe (test #isCue)
 
-secondPass :: Map OsPath Mapping -> [TrySplitCueFlacPair] -> ([SplitCueFlacPair], [Mapping])
-secondPass mappings cues = (cueSplits, Map.elems nonCueFlacMappings)
-  where
-    nonCueFlacMappings = Map.filterWithKey (\k _ -> k `Map.notMember` foundPairs) mappings
-    cueSplits = map (\(flac, (cue, to)) -> SplitCueFlacPair {cue, flac, to}) foundPairsList
-    foundPairs = Map.fromList foundPairsList
-    foundPairsList = do
-      TrySplitCueFlacPair cuePath <- cues
-      Convert {from = flacPath, to} <- mappings ^.. at (replaceExtension cuePath "flac") % _Just
-      pure (flacPath, (cuePath, takeDirectory to))
+    outputFor :: [OsString] -> Either MappingError OsPath
+    outputFor inpathS = case List.stripPrefix (toList inputS) (toList inpathS) of
+      Just relpath -> Right (joinPath (outputS ++ map mapBadChars relpath))
+      Nothing -> Left (CouldNotExtractPrefix inpathS)
 
-determineIfShouldConvert :: OsPath -> Eff es Bool
-determineIfShouldConvert path = pure False -- TODO
+    cueErrs :: [MappingError]
+    cueFlacs :: [Action]
+    (cueErrs, cueFlacs) = partitionEithers do
+      cue <- toList cueFiles
+      flac <- musicFiles ^.. at ((cue ^. #basename) <.> "flac") % _Just
+      let outDir = outputFor (List.init (flac ^. #components))
+      let mkCueSplit to = CueSplitAction {cue, flac, to}
+      pure (outDir <&> mkCueSplit)
+
+    cueFlacNames :: Set OsString
+    cueFlacNames = Set.fromList (mapMaybe (^? #flac % #filename) cueFlacs)
+
+    convertErrs :: [MappingError]
+    converts :: [Action]
+    (convertErrs, converts) =
+      partitionEithers $
+        toList (Map.filterWithKey (\k _ -> k `Set.notMember` cueFlacNames) musicFiles)
+          <&> \from ->
+            outputFor (from ^. #components) <&> \out ->
+              Convert {from, to = replaceExtension out outputExtension}
+
+    copiesErrs :: [MappingError]
+    copies :: [Action]
+    (copiesErrs, copies) =
+      partitionEithers $
+        toList imageFiles <&> \from ->
+          outputFor (from ^. #components) <&> \to -> Copy {from, to}
+
+  forM_ cueErrs (logAttention_ . show)
+  forM_ convertErrs (logAttention_ . show)
+  forM_ copiesErrs (logAttention_ . show)
+
+  pure (fromList (cueFlacs ++ converts ++ copies))
+
+--------------------------------------------------------------------------------
+
+streamVector :: (Monad m) => Stream (Of (Vector a)) m () -> Stream (Of a) m ()
+streamVector = flip S.for (mapM_ S.yield)
